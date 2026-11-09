@@ -50,7 +50,9 @@
 // B2EE Mass:
 // #define CF_MASS 0.0397f  // kg (40.5g) with propellor guards, 350mAh battery, and SD card deck
 // B1EE Mass:
-#define CF_MASS 0.0442f  // kg (40.5g) with propellor guards, 350mAh battery, and SD card deck
+// #define CF_MASS 0.0442f  // kg (40.5g) with propellor guards, 350mAh battery, and SD card deck
+#define CF_MASS 0.046f  // kg (40.5g) with propellor guards, 50mAh battery, and SD card deck
+
 
 // Thrust from PWM scaling for single motor
 // thrust(N) = a (PWM)^2 + b (PWM) + c

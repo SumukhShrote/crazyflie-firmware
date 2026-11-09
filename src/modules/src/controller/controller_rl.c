@@ -1,4 +1,4 @@
-
+//"controller_rl.c"
 #include "stabilizer_types.h"
 
 #include "attitude_controller.h"
@@ -54,18 +54,54 @@ static float obs_time;
 static float inference_time;
 static float in_to_out_latency;
 
+// Toggle these to 1 (True) or 0 (False) depending on which policy you flash
+#define USE_PREVIOUS_ACTION 1
+#define USE_ACTION_HISTORY  1
+#define USE_NEW_SCALARS     1
+
+#define ACTION_HISTORY_LENGTH 11
+
 // RL policy variables
 #define OBS_SIZE INPUT_SIZE  // Use the size from policy.h
 #define ACTION_SIZE OUTPUT_SIZE
+
+static float previous_action[ACTION_SIZE] = {0.0f, 0.0f, 0.0f, 0.0f}; // Initialize to zero
+
+#if USE_ACTION_HISTORY
+  #define HISTORY_STEPS (ACTION_HISTORY_LENGTH - 1)
+  static float action_history[HISTORY_STEPS][ACTION_SIZE] = {0};
+  static int history_head = 0; // Tracks the index of the most recent history slot
+#endif
+
+#if USE_NEW_SCALARS
+  // static float body_rate_scalar_xy = 315.127f; // 5.5 rad/s converted
+  // static float body_rate_scalar_z  = 85.944f;  // 1.5 rad/s converted
+  // static float body_rate_scalar_xy = 401.07f;  // 7.0 rad/s converted
+  // static float body_rate_scalar_xy = 430.00f;  // 7.5 rad/s converted
+  static float body_rate_scalar_xy = 458.37f;  // 8.0 rad/s converted
+  // static float body_rate_scalar_xy = 286.479f;  // 5.0 rad/s converted
+  static float body_rate_scalar_z  = 71.620f;   // 1.25 rad/s converted
+  // static float body_rate_scalar_xy = 100.0f;   // Test default
+  // static float body_rate_scalar_z  = 25.0f;    // Test default
+#else
+  static float body_rate_scalar_xy = 360.0f;   // Old default
+  static float body_rate_scalar_z  = 90.0f;    // Old default
+#endif
+
+
+
 static float observations[OBS_SIZE];
 static float actions[ACTION_SIZE];
-static float previous_action[ACTION_SIZE] = {0.0f, 0.0f, 0.0f, 0.0f}; // Initialize to zero
 static uint64_t first_call_time = 0;
+
+// For new policy with action history
+static bool is_active = false;
 
 // static float body_rate_scalar_xy = 720.0f; // Scale for XY body rates
 // static float body_rate_scalar_z = 720.0f;  // Scale for Z body
-static float body_rate_scalar_xy = 360.0f; // Scale for XY body rates
-static float body_rate_scalar_z = 90.0f;  // Scale for Z body
+// static float body_rate_scalar_xy = 360.0f; // Scale for XY body rates
+// static float body_rate_scalar_z = 90.0f;  // Scale for Z body
+
 
 static inline void tanh_inplace(float* data, uint16_t size) {
     // Calculate tanh using standard math library
@@ -140,6 +176,9 @@ void controllerRlInit(void)
 
   // Read the weights from policy.h and load them into matricies for fast inference. 
   policyLoadWeights();
+
+  // For new policy with action history
+  is_active = false;
 
   DEBUG_PRINT("Controller RL initialized\n");
 }
@@ -223,8 +262,19 @@ static void prepare_observations(const sensorData_t *sensors, const state_t *sta
         }
     }
 
+    // Add rolling action history
+  #if USE_ACTION_HISTORY
+      for (int h = 0; h < HISTORY_STEPS; h++) {
+          int ring_idx = (history_head - h + HISTORY_STEPS) % HISTORY_STEPS;
+          for (int i = 0; i < ACTION_SIZE; i++) {
+              observations[idx++] = action_history[ring_idx][i];
+          }
+      }
+  #endif
+
+    // Pad remaining space
     for (int i = idx; i < OBS_SIZE; i++) {
-        observations[i] = 0.0f;  // Pad with zeros if needed
+        observations[i] = 0.0f;  
     }
 }
 
@@ -245,6 +295,40 @@ void controllerRl(control_t *control, const setpoint_t *setpoint,
 
   // This is where we will call the RL controller and get the desired CTBR command
   if (RATE_DO_EXECUTE(POLICY_RATE_HZ, stabilizerStep)) {
+
+    // ==========================================
+    // --- MID-AIR CONTROLLER SWITCH LOGIC ---
+    // ==========================================
+    if (!is_active) {
+      // 1. Grab the exact thrust the previous controller (Mellinger) just generated
+      float last_raw_thrust = control->thrust; 
+      
+      // 2. Reverse the thrust mapping to translate 0-65535 back to RL's [-1.0, 1.0] action space
+      float mapped_hover_thrust = (last_raw_thrust / (float)UINT16_MAX) * 2.0f - 1.0f;
+      
+      // Clamp to ensure mathematical safety
+      mapped_hover_thrust = clamp(mapped_hover_thrust, -1.0f, 1.0f);
+
+      // 3. Warm-start the immediate previous action
+      for (int i = 0; i < ACTION_SIZE; i++) {
+          previous_action[i] = (i == 0) ? mapped_hover_thrust : 0.0f;
+      }
+      
+      // 4. Warm-start the entire sliding history buffer
+      #if USE_ACTION_HISTORY
+      for (int h = 0; h < HISTORY_STEPS; h++) {
+          for (int i = 0; i < ACTION_SIZE; i++) {
+              action_history[h][i] = (i == 0) ? mapped_hover_thrust : 0.0f;
+          }
+      }
+      history_head = 0; // Reset head on engage
+      #endif
+      
+      is_active = true;
+      DEBUG_PRINT("RL Controller Engaged! History Seeded with Thrust: %f\n", (double)mapped_hover_thrust);
+    }
+    // ==========================================
+
     // Prepare observations for the neural network
     uint64_t pre_obs_timestamp = usecTimestamp();
     prepare_observations(sensors, state, setpoint, previous_action);
@@ -262,10 +346,31 @@ void controllerRl(control_t *control, const setpoint_t *setpoint,
       actions[i] = clamp(actions[i], -1.0f, 1.0f); // Scale to [0, 1.0]
     }
 
-    // Store the previous action for the next iteration
+    // UPDATE ACTION HISTORY (O(1) Circular Buffer)
+    #if USE_ACTION_HISTORY
+    // Move head forward by 1, wrapping around if it reaches the end
+    history_head = (history_head + 1) % HISTORY_STEPS;
+    
+    // The new head becomes the most recent history slot (t-2),
+    // overwriting the oldest data that we no longer need.
+    for (int i = 0; i < ACTION_SIZE; i++) {
+        action_history[history_head][i] = previous_action[i];
+    }
+    #endif
+
+    // Store the newly generated action as the previous_action for the NEXT iteration (t-1)
+    #if USE_PREVIOUS_ACTION || USE_ACTION_HISTORY
     for (int i = 0; i < ACTION_SIZE; i++) {
       previous_action[i] = actions[i];
     }
+    #endif
+    
+    // Store the newly generated action as the previous_action for the NEXT iteration (t-1)
+    #if USE_PREVIOUS_ACTION || USE_ACTION_HISTORY
+    for (int i = 0; i < ACTION_SIZE; i++) {
+      previous_action[i] = actions[i];
+    }
+    #endif
 
     // // Overwrite actions based on time to get a step response in PITCH. 0.5s for -1.0, then 0.5s for +1.0, then back to 0.0
     // uint64_t current_time = usecTimestamp();
@@ -301,6 +406,81 @@ void controllerRl(control_t *control, const setpoint_t *setpoint,
     //     actions[2] = 0.0f; // Pitch rate
     //     actions[3] = 0.0f; // Yaw rate
     // }
+
+    // Overwrite actions based on time to get a step response for thrust, roll, pitch, and yaw. 
+    // uint64_t current_time = usecTimestamp();
+    // float elapsed_time = (current_time - first_call_time) * 1e-6f; // seconds
+
+    // if (elapsed_time < 0.3f) {
+    //   // 0-0.3s: THRUST steps (hover -> full -> hover)
+    //   if (elapsed_time < 0.1f){
+    //       actions[0] = 0.0f;  // Mid thrust
+    //       actions[1] = 0.0f; // Roll rate
+    //       actions[2] = 0.0f; // Pitch rate
+    //       actions[3] = 0.0f; // Yaw rate
+
+    //   }           
+    //   else if (elapsed_time < 0.2f){
+    //       actions[0] = 0.0f;  // Full thrust
+    //       actions[1] = 0.0f; // Roll rate
+    //       actions[2] = 0.0f; // Pitch rate
+    //       actions[3] = 0.0f; // Yaw rate
+    //   }        
+    //   else {
+    //       actions[0] = 0.0f; // Mid thrust
+    //       actions[1] = 0.0f; // Roll rate
+    //       actions[2] = 0.0f; // Pitch rate
+    //       actions[3] = 0.0f; // Yaw rate
+    //   }   
+    // } 
+    // else if (elapsed_time < 0.5f) {
+    //   // 0.3-0.5s: ROLL steps
+    //   actions[0] = 0.0f; // Fixed mid-thrust
+    //   actions[2] = 0.0f; // Pitch rate
+    //   actions[3] = 0.0f; // Yaw rate
+    //   actions[1] = (elapsed_time < 0.4f) ? 0.2f : -0.2f;   // ±Roll
+    // } 
+    // else if (elapsed_time < 0.7f) {
+    //   // 0.5-0.7s: PITCH steps  
+    //   actions[0] = 0.0f; // Fixed mid-thrust
+    //   actions[1] = 0.0f; // Roll rate
+    //   actions[3] = 0.0f; // Yaw Rate  
+    //   actions[2] = (elapsed_time < 0.6f) ? 0.2f : -0.2f;   // ±Pitch
+    // } 
+    // else if (elapsed_time < 0.9f) {
+    //   // 0.7-0.9s: YAW steps (±90°/s)
+    //   actions[0] = 0.0f; // Fixed mid-thrust
+    //   actions[1] = 0.0f; // Roll rate
+    //   actions[2] = 0.0f; // Pitch rate
+    //   actions[3] = (elapsed_time < 0.8f) ? 0.2f : -0.2f;   // ±Yaw
+    // } 
+    // else {
+    //   // 0.9s+: Hover safely
+    //   actions[0] = 0.0f; 
+    //   actions[1] = 0.0f; 
+    //   actions[2] = 0.0f; 
+    //   actions[3] = 0.0f;
+    // }
+    
+    // Test Run 1
+    // actions[0] = 0.05f;
+    
+    // Test Run 2
+    // actions[0] = -0.05f; 
+    // actions[1] = -0.01f;
+    
+    // Test Run 3
+    // actions[0] = -0.05f; 
+    // actions[1] = 0.0f;
+    // actions[2] = -0.01f; 
+    // actions[3] = 0.0f;
+
+    // Test Run 4
+    // actions[0] = -0.05f; 
+    // actions[1] = 0.0f;
+    // actions[2] = -0.02f; 
+    // actions[3] = 0.0f;
+
 
     actuatorThrust = ((actions[0]+ 1.0f) / 2.0f) * UINT16_MAX; // Scale to thrust range
     control->thrust = actuatorThrust;
@@ -353,6 +533,7 @@ void controllerRl(control_t *control, const setpoint_t *setpoint,
 
     // Reset the calculated YAW angle for rate control
     attitudeDesired.yaw = state->attitude.yaw;
+
   }
 }
 
